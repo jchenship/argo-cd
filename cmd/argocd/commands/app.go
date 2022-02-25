@@ -1350,9 +1350,13 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				}
 			}
 
+			log.Debugf("got %v apps", len(appNames))
+
 			for _, appName := range appNames {
+				log.Debugf("preparing for app %v", appName)
 
 				if len(selectedLabels) > 0 {
+					log.Debug("trying to get resources with selectedLabels")
 					ctx := context.Background()
 
 					q := applicationpkg.ApplicationManifestQuery{
@@ -1372,6 +1376,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 							if objectValue, ok := obj.GetLabels()[key]; ok && selectedValue == objectValue {
 								gvk := obj.GroupVersionKind()
 								resources = append(resources, fmt.Sprintf("%s:%s:%s", gvk.Group, gvk.Kind, obj.GetName()))
+								log.Debugf("resource %s added", fmt.Sprintf("%s:%s:%s", gvk.Group, gvk.Kind, obj.GetName()))
 							}
 						}
 					}
@@ -1454,9 +1459,11 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 						},
 					}
 				}
+				log.Debugf("started to send sync command for app %v", appName)
 				ctx := context.Background()
 				_, err := appIf.Sync(ctx, &syncReq)
 				errors.CheckError(err)
+				log.Debugf("sent sync command for app %v", appName)
 
 				if !async {
 					app, err := waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, selectedResources)
@@ -1634,28 +1641,35 @@ func waitOnApplicationStatus(acdClient argocdclient.Client, appName string, time
 	refresh := false
 
 	printFinalStatus := func(app *argoappv1.Application) *argoappv1.Application {
+		log.Debug("start printFinalStatus")
 		var err error
 		if refresh {
+			log.Debug("printFinalStatus needs refresh")
 			conn, appClient := acdClient.NewApplicationClientOrDie()
 			refreshType := string(argoappv1.RefreshTypeNormal)
 			app, err = appClient.Get(context.Background(), &applicationpkg.ApplicationQuery{Name: &appName, Refresh: &refreshType})
 			errors.CheckError(err)
 			_ = conn.Close()
+			log.Debug("got refreshed app")
 		}
 
+		log.Debug("printAppSummaryTable")
 		fmt.Println()
 		printAppSummaryTable(app, appURL(acdClient, appName), nil)
 		fmt.Println()
 		if watchOperation {
+			log.Debug("printOperationResult")
 			printOperationResult(app.Status.OperationState)
 		}
 
 		if len(app.Status.Resources) > 0 {
+			log.Debug("printAppResources")
 			fmt.Println()
 			w := tabwriter.NewWriter(os.Stdout, 5, 0, 2, ' ', 0)
 			printAppResources(w, app)
 			_ = w.Flush()
 		}
+		log.Debug("printFinalStatus before return")
 		return app
 	}
 
@@ -1675,34 +1689,41 @@ func waitOnApplicationStatus(acdClient argocdclient.Client, appName string, time
 	errors.CheckError(err)
 	appEventCh := acdClient.WatchApplicationWithRetry(ctx, appName, app.ResourceVersion)
 	for appEvent := range appEventCh {
+		log.Debugf("received event type %v", appEvent.Type)
 		app = &appEvent.Application
 
 		operationInProgress := false
 		// consider the operation is in progress
 		if app.Operation != nil {
+			log.Debug("operation is not nil")
 			// if it just got requested
 			operationInProgress = true
 			if !app.Operation.DryRun() {
 				refresh = true
 			}
 		} else if app.Status.OperationState != nil {
+			log.Debug("operation state is not nil")
 			if app.Status.OperationState.FinishedAt == nil {
+				log.Debug("operation state finished at is nil")
 				// if it is not finished yet
 				operationInProgress = true
 			} else if !app.Status.OperationState.Operation.DryRun() && (app.Status.ReconciledAt == nil || app.Status.ReconciledAt.Before(app.Status.OperationState.FinishedAt)) {
 				// if it is just finished and we need to wait for controller to reconcile app once after syncing
+				log.Debug("waiting for reconcile")
 				operationInProgress = true
 			}
 		}
 
 		var selectedResourcesAreReady bool
 
+		log.Debug("checking resources readiness")
 		// If selected resources are included, wait only on those resources, otherwise wait on the application as a whole.
 		if len(selectedResources) > 0 {
 			selectedResourcesAreReady = true
 			for _, state := range getResourceStates(app, selectedResources) {
 				resourceIsReady := checkResourceStatus(watchSync, watchHealth, watchOperation, watchSuspended, state.Health, state.Status, appEvent.Application.Operation)
 				if !resourceIsReady {
+					log.Debugf("resource %v is not ready", state.Key())
 					selectedResourcesAreReady = false
 					break
 				}
@@ -1712,11 +1733,15 @@ func waitOnApplicationStatus(acdClient argocdclient.Client, appName string, time
 			selectedResourcesAreReady = checkResourceStatus(watchSync, watchHealth, watchOperation, watchSuspended, string(app.Status.Health.Status), string(app.Status.Sync.Status), appEvent.Application.Operation)
 		}
 
+		log.Debugf("selectedResourcesAreReady: %v", selectedResourcesAreReady)
+		log.Debugf("operationInProgress: %v", operationInProgress)
+		log.Debugf("watchOperation: %v", watchOperation)
 		if selectedResourcesAreReady && (!operationInProgress || !watchOperation) {
 			app = printFinalStatus(app)
 			return app, nil
 		}
 
+		log.Debug("checking whether resource states have changed")
 		newStates := groupResourceStates(app, selectedResources)
 		for _, newState := range newStates {
 			var doPrint bool
@@ -1727,8 +1752,10 @@ func waitOnApplicationStatus(acdClient argocdclient.Client, appName string, time
 					return nil, fmt.Errorf("application '%s' health state has transitioned from %s to %s", appName, prevState.Health, newState.Health)
 				}
 				doPrint = prevState.Merge(newState)
+				log.Debug("resource states changed")
 			} else {
 				prevStates[stateKey] = newState
+				log.Debug("no previous state")
 				doPrint = true
 			}
 			if doPrint {
